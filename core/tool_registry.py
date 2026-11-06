@@ -160,6 +160,15 @@ def filter_server_tools(server) -> int:
     read_only_mode = is_read_only_mode()
     allowed_scopes = set(get_all_read_only_scopes()) if read_only_mode else None
 
+    # Fail closed (EVA hardening): in read-only mode the write-tool removal below MUST run against a
+    # real tool list. If introspection returned nothing (FastMCP internals changed), removing nothing
+    # would silently leave every write tool registered — refuse to start instead.
+    if read_only_mode and not tool_components:
+        raise RuntimeError(
+            "read-only mode requested but no tools are introspectable "
+            "(FastMCP internals changed?); refusing to start rather than expose write tools"
+        )
+
     tools_to_remove = set()
 
     # 1. Tier filtering
@@ -237,20 +246,32 @@ def filter_server_tools(server) -> int:
     for tool_name in tools_to_remove:
         try:
             server.local_provider.remove_tool(tool_name)
-        except AttributeError:
-            logger.warning(
-                "Failed to remove tool '%s': remove_tool not available on server.local_provider",
-                tool_name,
-            )
-            continue
-        except Exception as exc:
-            logger.warning(
-                "Failed to remove tool '%s': %s",
-                tool_name,
-                exc,
-            )
+        except Exception as exc:  # noqa: BLE001 - a failed removal must not silently expose a tool
+            # Fail closed (EVA hardening): in read-only mode a tool we meant to remove staying is a
+            # write tool left exposed — refuse to start. Outside read-only mode, warn and continue.
+            if read_only_mode:
+                raise RuntimeError(
+                    f"read-only mode: failed to remove tool '{tool_name}': {exc}"
+                ) from exc
+            logger.warning("Failed to remove tool '%s': %s", tool_name, exc)
             continue
         tools_removed += 1
+
+    # Fail closed (EVA hardening): confirm no write-scoped tool survived the read-only filter.
+    # Gated to match the section-3 filter above (`read_only_mode and not permissions_mode`): when
+    # permissions mode is active the governing allow-set is `perm_allowed`, not `allowed_scopes`,
+    # so checking against `allowed_scopes` there would wrongly refuse to start.
+    if read_only_mode and not permissions_mode:
+        leaked = []
+        for tool_name, tool_obj in get_tool_components(server).items():
+            func_to_check = getattr(tool_obj, "fn", tool_obj)
+            required_scopes = getattr(func_to_check, "_required_google_scopes", [])
+            if required_scopes and not all(s in allowed_scopes for s in required_scopes):
+                leaked.append(tool_name)
+        if leaked:
+            raise RuntimeError(
+                f"read-only mode: write-scoped tools survived the filter: {sorted(leaked)}"
+            )
 
     if tools_removed > 0:
         enabled_count = len(enabled_tools) if enabled_tools is not None else "all"
